@@ -10,6 +10,12 @@ This repository hosts:
 pip install git+https://github.com/openai/sparse_autoencoder.git
 ```
 
+login into W&B (optional)
+
+```
+wandb login
+```
+
 ## Environment details
 ```
 uv venv --python 3.11

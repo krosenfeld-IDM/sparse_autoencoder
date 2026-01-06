@@ -697,8 +697,8 @@ class Config:
     dead_toks_threshold: int = 10_000_000
     ema_multiplier: float | None = None
     
-    wandb_project: str | None = None
-    wandb_name: str | None = None
+    wandb_project: str | None = "sparse_autoencoder"
+    wandb_name: str | None = "gpt2-small-example"
 
 
 def main():
