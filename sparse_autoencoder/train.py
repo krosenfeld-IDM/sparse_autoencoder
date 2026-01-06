@@ -682,7 +682,7 @@ class EmaModel:
 @dataclass
 class Config:
     n_op_shards: int = 1
-    n_replicas: int = 8
+    n_replicas: int = 1 # 8
 
     n_dirs: int = 32768
     bs: int = 131072
@@ -705,9 +705,65 @@ def main():
     cfg = Config()
     comms = make_torch_comms(n_op_shards=cfg.n_op_shards, n_replicas=cfg.n_replicas)
 
-    ## dataloading is left as an exercise for the reader
-    acts_iter = ...
-    stats_acts_sample = ...
+    ## dataloading
+    # Option 1: Load activations from transformer_lens (example implementation)
+    # You'll need to adapt this to your specific data source
+    import transformer_lens
+    
+    # Load model and extract activations
+    model = transformer_lens.HookedTransformer.from_pretrained("gpt2", center_writing_weights=False)
+    
+    # Configuration for which activations to extract
+    layer_index = 6  # Adjust as needed
+    location = "resid_post_mlp"  # Options: "mlp_post_act", "resid_delta_attn", "resid_post_attn", "resid_delta_mlp", "resid_post_mlp"
+    transformer_lens_loc = {
+        "mlp_post_act": f"blocks.{layer_index}.mlp.hook_post",
+        "resid_delta_attn": f"blocks.{layer_index}.hook_attn_out",
+        "resid_post_attn": f"blocks.{layer_index}.hook_resid_mid",
+        "resid_delta_mlp": f"blocks.{layer_index}.hook_mlp_out",
+        "resid_post_mlp": f"blocks.{layer_index}.hook_resid_post",
+    }[location]
+    
+    # Generate or load your dataset of text prompts
+    # This is a simple example - replace with your actual data loading
+    prompts = [
+        "This is an example of a prompt that",
+        "The quick brown fox jumps over",
+        "In a world where technology",
+        # Add your actual training prompts here
+    ] * 1000  # Repeat to get enough data
+    
+    def generate_activations():
+        """Generator that yields activation tensors"""
+        for prompt in prompts:
+            tokens = model.to_tokens(prompt)  # (1, n_tokens)
+            with torch.no_grad():
+                _, activation_cache = model.run_with_cache(tokens, remove_batch_dim=True)
+            acts = activation_cache[transformer_lens_loc]  # (n_tokens, d_model)
+            yield acts
+    
+    # acts_iter: Generator that yields activation tensors from a transformer model. It:
+    # Loads GPT-2 using transformer_lens
+    # Processes text prompts to extract activations
+    # Yields tensors of shape [n_tokens, d_model] (which batch_tensors will batch)
+    acts_iter = generate_activations()
+        
+    # For stats_acts_sample, collect a sample of activations for initialization
+    # Need at least 32768 samples (see init_from_data_)
+    sample_size = max(32768, 50000)  # Use more for better initialization
+    stats_acts_list = []
+    for acts in generate_activations():
+        stats_acts_list.append(acts)
+        if sum(a.shape[0] for a in stats_acts_list) >= sample_size:
+            break
+    # stats_acts_sample: Sample tensor for initialization, collected from the first activations (at least 32,768 samples as required by init_from_data_)        
+    stats_acts_sample = torch.cat(stats_acts_list, dim=0)[:sample_size].cuda()
+    
+    # Alternative: If you have pre-saved activation files, you can load them like:
+    # import blobfile as bf
+    # with bf.BlobFile("path/to/activations.pt", mode="rb") as f:
+    #     acts_iter = iter(torch.load(f))  # Assuming saved as list of tensors
+    #     stats_acts_sample = torch.cat(list(acts_iter)[:sample_size], dim=0).cuda()
 
     n_dirs_local = cfg.n_dirs // cfg.n_op_shards
     bs_local = cfg.bs // cfg.n_replicas
