@@ -554,6 +554,40 @@ class Logger:
 def training_loop_(
     ae, train_acts_iter, loss_fn, lr, comms, eps=6.25e-10, clip_grad=None, ema_multiplier=0.999, logger=None
 ):
+    """
+    Training loop for sparse autoencoder with distributed training support.
+
+    This function implements a complete training loop with mixed precision (FP16),
+    distributed data parallelism, gradient synchronization, and optional gradient
+    clipping and exponential moving average (EMA) updates.
+
+    Args:
+        ae: The autoencoder model to train (typically FastAutoencoder).
+        train_acts_iter: Iterator yielding batches of training activations.
+            Each batch should be a tensor of shape [batch_size, d_model].
+        loss_fn: Callable that computes the loss. Signature:
+            loss_fn(ae, flat_acts_train_batch, recons, info, logger) -> torch.Tensor
+            where recons and info are the outputs from ae(flat_acts_train_batch).
+        lr: Learning rate for the Adam optimizer.
+        comms: Communication object (Comm instance) for distributed training operations.
+        eps: Epsilon parameter for Adam optimizer. Defaults to 6.25e-10.
+        clip_grad: Optional gradient clipping value. If provided, gradients are
+            clipped to this norm. Defaults to None (no clipping).
+        ema_multiplier: Multiplier for exponential moving average updates.
+            If None, EMA is disabled. Defaults to 0.999.
+        logger: Optional Logger instance for logging metrics. If None, a dummy
+            logger is created. Defaults to None.
+
+    The training loop performs the following steps for each batch:
+        1. Forward pass with mixed precision (autocast)
+        2. Loss computation
+        3. Backward pass with gradient scaling
+        4. Unit norm constraints on decoder weights
+        5. Gradient synchronization across distributed processes
+        6. Optional gradient clipping
+        7. Optional EMA update
+        8. Optimizer step with loss scale update
+    """
     if logger is None:
         logger = Logger(dummy=True)
 
