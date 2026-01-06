@@ -32,26 +32,93 @@ RANK = int(os.environ.get("RANK", "0"))
 
 @dataclass
 class Comm:
+    """
+    Wrapper around a PyTorch distributed ProcessGroup for collective operations.
+    
+    Attributes:
+        group: The PyTorch distributed ProcessGroup to use for communication.
+    """
     group: torch.distributed.ProcessGroup
 
     def all_reduce(self, x, op=ReduceOp.SUM, async_op=False):
+        """
+        Perform an all-reduce operation across all processes in the group.
+        
+        Args:
+            x: Tensor to reduce.
+            op: Reduction operation (default: SUM).
+            async_op: Whether to perform the operation asynchronously.
+            
+        Returns:
+            Result of the all-reduce operation.
+        """
         return dist.all_reduce(x, op=op, group=self.group, async_op=async_op)
 
     def all_gather(self, x_list, x, async_op=False):
+        """
+        Gather tensors from all processes in the group.
+        
+        Args:
+            x_list: List to store gathered tensors.
+            x: Tensor to gather from this process.
+            async_op: Whether to perform the operation asynchronously.
+            
+        Returns:
+            Result of the all-gather operation.
+        """
         return dist.all_gather(list(x_list), x, group=self.group, async_op=async_op)
 
     def broadcast(self, x, src, async_op=False):
+        """
+        Broadcast a tensor from the source process to all processes in the group.
+        
+        Args:
+            x: Tensor to broadcast (will be overwritten on non-source processes).
+            src: Rank of the source process.
+            async_op: Whether to perform the operation asynchronously.
+            
+        Returns:
+            Result of the broadcast operation.
+        """
         return dist.broadcast(x, src, group=self.group, async_op=async_op)
 
     def barrier(self):
+        """
+        Synchronize all processes in the group.
+        
+        Returns:
+            Result of the barrier operation.
+        """
         return dist.barrier(group=self.group)
 
     def size(self):
+        """
+        Get the number of processes in the group.
+        
+        Returns:
+            Number of processes in the group.
+        """
         return self.group.size()
 
 
 @dataclass
 class ShardingComms:
+    """
+    Communication utilities for sharded and data-parallel training.
+    
+    Manages communication groups for both data parallelism (DP) and operation sharding.
+    Provides methods for synchronizing gradients, activations, and other tensors across
+    distributed processes.
+    
+    Attributes:
+        n_replicas: Number of data parallel replicas.
+        n_op_shards: Number of operation shards.
+        dp_rank: Data parallel rank of this process.
+        sh_rank: Shard rank of this process.
+        dp_comm: Communication group for data parallelism (None if not using DP).
+        sh_comm: Communication group for operation sharding (None if not using sharding).
+        _rank: Global rank of this process.
+    """
     n_replicas: int
     n_op_shards: int
     dp_rank: int
@@ -61,6 +128,18 @@ class ShardingComms:
     _rank: int
 
     def sh_allreduce_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Perform all-reduce on shard dimension during forward pass.
+        
+        The all-reduce happens in the forward pass, and gradients pass through unchanged.
+        This is used for synchronizing activations across shards.
+        
+        Args:
+            x: Tensor to all-reduce across shards.
+            
+        Returns:
+            All-reduced tensor (in-place modification).
+        """
         if self.sh_comm is None:
             return x
 
@@ -78,6 +157,18 @@ class ShardingComms:
         return AllreduceForward.apply(x)  # type: ignore
 
     def sh_allreduce_backward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Perform all-reduce on shard dimension during backward pass.
+        
+        The all-reduce happens in the backward pass, and forward pass is unchanged.
+        This is used for synchronizing gradients across shards.
+        
+        Args:
+            x: Tensor to all-reduce across shards.
+            
+        Returns:
+            Tensor with all-reduce applied in backward pass.
+        """
         if self.sh_comm is None:
             return x
 
@@ -96,6 +187,15 @@ class ShardingComms:
         return AllreduceBackward.apply(x)  # type: ignore
 
     def init_broadcast_(self, autoencoder):
+        """
+        Broadcast initial parameters from rank 0 to all data parallel replicas.
+        
+        Also broadcasts pre_bias from shard 0 to all shards within each replica.
+        This ensures all processes start with the same initial weights.
+        
+        Args:
+            autoencoder: The autoencoder model whose parameters to broadcast.
+        """
         if self.dp_comm is not None:
             for p in autoencoder.parameters():
                 self.dp_comm.broadcast(
@@ -119,6 +219,15 @@ class ShardingComms:
             )
 
     def dp_allreduce_(self, autoencoder) -> None:
+        """
+        Average gradients across all data parallel replicas.
+        
+        Also synchronizes dead neuron statistics (stats_last_nonzero) using MIN reduction
+        to ensure correct statistics across replicas.
+        
+        Args:
+            autoencoder: The autoencoder model whose gradients to average.
+        """
         if self.dp_comm is None:
             return
 
@@ -132,6 +241,15 @@ class ShardingComms:
         )
 
     def sh_allreduce_scale(self, scaler):
+        """
+        Synchronize loss scale across all shards using MIN reduction.
+        
+        This ensures all shards use the same loss scale for mixed precision training,
+        preventing divergence in gradient scaling.
+        
+        Args:
+            scaler: The GradScaler instance to synchronize.
+        """
         if self.sh_comm is None:
             return
 
@@ -140,6 +258,16 @@ class ShardingComms:
             self.sh_comm.all_reduce(scaler._growth_tracker, op=ReduceOp.MIN, async_op=True)
 
     def _sh_comm_op(self, x, op):
+        """
+        Internal helper to perform a reduction operation across shards.
+        
+        Args:
+            x: Tensor or scalar to reduce.
+            op: Reduction operation to apply.
+            
+        Returns:
+            Cloned tensor before reduction (the reduction happens in-place on x).
+        """
         if isinstance(x, (float, int)):
             x = torch.tensor(x, device="cuda")
 
@@ -154,9 +282,30 @@ class ShardingComms:
         return out
 
     def sh_sum(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Sum a tensor across all shards.
+        
+        Args:
+            x: Tensor to sum.
+            
+        Returns:
+            Cloned tensor before sum (the sum happens in-place on x).
+        """
         return self._sh_comm_op(x, ReduceOp.SUM)
 
     def all_broadcast(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Broadcast a tensor to all processes (both DP and shard dimensions).
+        
+        First broadcasts across data parallel replicas, then across shards.
+        This ensures all processes have the same value.
+        
+        Args:
+            x: Tensor to broadcast.
+            
+        Returns:
+            Broadcasted tensor (in-place modification).
+        """
         if self.dp_comm is not None:
             self.dp_comm.broadcast(
                 x,
@@ -181,6 +330,19 @@ class ShardingComms:
 
 
 def make_torch_comms(n_op_shards=4, n_replicas=2):
+    """
+    Initialize distributed communication groups for sharded and data-parallel training.
+    
+    Sets up process groups for both operation sharding and data parallelism.
+    If RANK is not set in the environment, returns TRIVIAL_COMMS for single-process training.
+    
+    Args:
+        n_op_shards: Number of operation shards (default: 4).
+        n_replicas: Number of data parallel replicas (default: 2).
+        
+    Returns:
+        ShardingComms instance configured for the current process.
+    """
     if "RANK" not in os.environ:
         assert n_op_shards == 1
         assert n_replicas == 1
@@ -228,6 +390,17 @@ def make_torch_comms(n_op_shards=4, n_replicas=2):
 
 
 def replica_shard_to_rank(replica_idx, shard_idx, n_op_shards):
+    """
+    Convert replica and shard indices to a global rank.
+    
+    Args:
+        replica_idx: Index of the data parallel replica.
+        shard_idx: Index of the operation shard.
+        n_op_shards: Total number of operation shards.
+        
+    Returns:
+        Global rank corresponding to the given replica and shard indices.
+    """
     return replica_idx * n_op_shards + shard_idx
 
 
@@ -243,6 +416,29 @@ TRIVIAL_COMMS = ShardingComms(
 
 
 def sharded_topk(x, k, sh_comm, capacity_factor=None):
+    """
+    Compute top-k elements across sharded dimensions.
+    
+    Each shard computes top-k locally, then all shards exchange values to determine
+    the global top-k. Each shard returns only the indices/values that are in the
+    global top-k.
+    
+    Args:
+        x: Input tensor of shape [batch, n_dirs_local] where n_dirs_local is the
+            number of directions on this shard.
+        k: Number of top elements to select globally.
+        sh_comm: Shard communication group (None for single shard).
+        capacity_factor: Optional factor to increase local k for better approximation
+            of global top-k. If provided, each shard computes top-k * capacity_factor
+            locally before exchanging.
+            
+    Returns:
+        Tuple of (indices, values) where:
+            - indices: Tensor of shape [batch, k] with indices of top-k elements
+                (only valid for this shard, others are zero)
+            - values: Tensor of shape [batch, k] with values of top-k elements
+                (only valid for this shard, others are zero)
+    """
     batch = x.shape[0]
 
     if sh_comm is not None and capacity_factor is not None:
@@ -295,6 +491,20 @@ class FastAutoencoder(nn.Module):
         dead_steps_threshold: int,
         comms: ShardingComms | None = None,
     ):
+        """
+        Initialize a FastAutoencoder.
+        
+        Args:
+            n_dirs_local: Number of dictionary directions on this shard.
+            d_model: Dimension of input/output activations.
+            k: Number of top-k features to activate.
+            auxk: Optional number of auxiliary top-k features for auxiliary loss.
+                If None, auxiliary loss is disabled.
+            dead_steps_threshold: Number of steps without activation before a neuron
+                is considered "dead" and masked in auxk computation.
+            comms: Communication utilities for distributed training. If None, uses
+                TRIVIAL_COMMS for single-process training.
+        """
         super().__init__()
         self.n_dirs_local = n_dirs_local
         self.d_model = d_model
@@ -331,9 +541,30 @@ class FastAutoencoder(nn.Module):
 
     @property
     def n_dirs(self):
+        """
+        Total number of dictionary directions across all shards.
+        
+        Returns:
+            Total number of directions (n_dirs_local * n_op_shards).
+        """
         return self.n_dirs_local * self.comms.n_op_shards
 
     def forward(self, x):
+        """
+        Forward pass of the autoencoder.
+        
+        Computes:
+            latents = relu(topk(encoder(x - pre_bias) + latent_bias))
+            recons = decoder(latents) + pre_bias
+        
+        Args:
+            x: Input activations of shape [batch, d_model].
+            
+        Returns:
+            Tuple of (reconstructions, info_dict) where:
+                - reconstructions: Reconstructed activations of shape [batch, d_model]
+                - info_dict: Dictionary containing auxk_inds and auxk_vals if auxk is enabled
+        """
         class EncWrapper(torch.autograd.Function):
             @staticmethod
             def forward(ctx, x, pre_bias, weight, latent_bias):
@@ -429,6 +660,16 @@ class FastAutoencoder(nn.Module):
         }
 
     def decode_sparse(self, inds, vals):
+        """
+        Decode sparse activations to reconstructions.
+        
+        Args:
+            inds: Indices of active features, shape [batch, k].
+            vals: Values of active features, shape [batch, k].
+            
+        Returns:
+            Reconstructions of shape [batch, d_model].
+        """
         recons = TritonDecoderAutograd.apply(inds, vals, self.decoder.weight)
         recons = self.comms.sh_allreduce_forward(recons)
 
@@ -456,10 +697,37 @@ def unit_norm_decoder_grad_adjustment_(autoencoder) -> None:
 
 
 def maybe_transpose(x):
+    """
+    Transpose a tensor if the transpose is more contiguous.
+    
+    This is useful for ensuring tensors are in the right memory layout for
+    efficient operations.
+    
+    Args:
+        x: Input tensor.
+        
+    Returns:
+        Transposed tensor if transpose is more contiguous, otherwise original tensor.
+    """
     return x.T if not x.is_contiguous() and x.T.is_contiguous() else x
 
 
 def sharded_grad_norm(autoencoder, comms, exclude=None):
+    """
+    Compute the gradient norm across all shards and replicas.
+    
+    Sums squared norms across all parameters, accounting for sharding.
+    For pre_bias (which is replicated across shards), counts it only once.
+    For other parameters, sums across all shards.
+    
+    Args:
+        autoencoder: The autoencoder model.
+        comms: Communication utilities for distributed operations.
+        exclude: Optional set of parameters to exclude from norm computation.
+        
+    Returns:
+        Total gradient norm (L2 norm across all parameters).
+    """
     if exclude is None:
         exclude = []
     total_sq_norm = torch.zeros((), device="cuda", dtype=torch.float32)
@@ -524,6 +792,15 @@ def batch_tensors(
 
 
 def print0(*a, **k):
+    """
+    Print only on rank 0 process.
+    
+    Useful for avoiding duplicate output in distributed training.
+    
+    Args:
+        *a: Positional arguments to pass to print.
+        **k: Keyword arguments to pass to print.
+    """
     if RANK == 0:
         print(*a, **k)
 
@@ -532,7 +809,20 @@ import wandb
 
 
 class Logger:
+    """
+    Logger for training metrics using Weights & Biases (wandb).
+    
+    Only logs on rank 0 to avoid duplicate entries. Can be disabled by passing
+    dummy=True or by not running on rank 0.
+    """
     def __init__(self, **kws):
+        """
+        Initialize the logger.
+        
+        Args:
+            **kws: Keyword arguments to pass to wandb.init(). Use dummy=True to
+                disable logging even on rank 0.
+        """
         self.vals = {}
         self.enabled = (RANK == 0) and not kws.pop("dummy", False)
         if self.enabled:
@@ -541,11 +831,24 @@ class Logger:
             )
 
     def logkv(self, k, v):
+        """
+        Log a key-value pair (buffered, not immediately sent to wandb).
+        
+        Args:
+            k: Key name for the metric.
+            v: Value to log (tensors are detached automatically).
+            
+        Returns:
+            The value v (for chaining).
+        """
         if self.enabled:
             self.vals[k] = v.detach() if isinstance(v, torch.Tensor) else v
         return v
 
     def dumpkvs(self):
+        """
+        Send all buffered key-value pairs to wandb and clear the buffer.
+        """
         if self.enabled:
             wandb.log(self.vals)
             self.vals = {}
@@ -646,6 +949,19 @@ def training_loop_(
 
 
 def init_from_data_(ae, stats_acts_sample, comms):
+    """
+    Initialize autoencoder parameters from a sample of activations.
+    
+    Sets pre_bias to the geometric median of the activation sample, and scales
+    encoder weights to ensure reasonable output norms. The geometric median is
+    more robust to outliers than the mean.
+    
+    Args:
+        ae: The autoencoder to initialize.
+        stats_acts_sample: Sample of activations of shape [n_samples, d_model].
+            Should have at least 32768 samples.
+        comms: Communication utilities for broadcasting initialized parameters.
+    """
     from geom_median.torch import compute_geometric_median
 
     ae.pre_bias.data = (
@@ -673,6 +989,19 @@ from contextlib import contextmanager
 
 @contextmanager
 def temporary_weight_swap(model: torch.nn.Module, new_weights: list[torch.Tensor]):
+    """
+    Context manager to temporarily swap model weights with new weights.
+    
+    On entry, swaps model parameters with new_weights. On exit, swaps them back.
+    Useful for temporarily using EMA weights or other weight sets.
+    
+    Args:
+        model: The model whose weights to swap.
+        new_weights: List of tensors to swap in (must match model.parameters()).
+        
+    Yields:
+        None (the model is modified in-place).
+    """
     for _p, new_p in zip(model.parameters(), new_weights, strict=True):
         assert _p.shape == new_p.shape
         _p.data, new_p.data = new_p.data, _p.data
@@ -685,13 +1014,32 @@ def temporary_weight_swap(model: torch.nn.Module, new_weights: list[torch.Tensor
 
 
 class EmaModel:
+    """
+    Exponential Moving Average (EMA) of model weights.
+    
+    Maintains a running average of model parameters using exponential moving average.
+    Provides a context manager to temporarily use EMA weights for evaluation.
+    """
     def __init__(self, model, ema_multiplier):
+        """
+        Initialize EMA model.
+        
+        Args:
+            model: The model to track EMA weights for.
+            ema_multiplier: EMA decay factor (typically close to 1, e.g., 0.999).
+                Higher values mean slower updates.
+        """
         self.model = model
         self.ema_multiplier = ema_multiplier
         self.ema_weights = [torch.zeros_like(x, requires_grad=False) for x in model.parameters()]
         self.ema_steps = 0
 
     def step(self):
+        """
+        Update EMA weights with current model weights.
+        
+        Performs: ema_weights = ema_multiplier * ema_weights + (1 - ema_multiplier) * model_weights
+        """
         torch._foreach_lerp_(
             self.ema_weights,
             list(self.model.parameters()),
@@ -699,9 +1047,20 @@ class EmaModel:
         )
         self.ema_steps += 1
 
-    # context manager for setting the autoencoder weights to the EMA weights
     @contextmanager
     def use_ema_weights(self):
+        """
+        Context manager to temporarily use EMA weights in the model.
+        
+        Applies bias correction to account for warm-up period. The model weights
+        are swapped with bias-corrected EMA weights for the duration of the context.
+        
+        Yields:
+            None (the model is modified in-place).
+            
+        Raises:
+            AssertionError: If step() has not been called at least once.
+        """
         assert self.ema_steps > 0
 
         # apply bias correction
@@ -715,6 +1074,27 @@ class EmaModel:
 
 @dataclass
 class Config:
+    """
+    Configuration for sparse autoencoder training.
+    
+    Attributes:
+        n_op_shards: Number of operation shards for distributed training.
+        n_replicas: Number of data parallel replicas.
+        n_dirs: Total number of dictionary directions.
+        bs: Batch size.
+        d_model: Dimension of input/output activations.
+        k: Number of top-k features to activate.
+        auxk: Number of auxiliary top-k features for auxiliary loss.
+        lr: Learning rate for Adam optimizer.
+        eps: Epsilon parameter for Adam optimizer.
+        clip_grad: Gradient clipping norm (None to disable).
+        auxk_coef: Coefficient for auxiliary loss term.
+        dead_toks_threshold: Number of tokens without activation before a neuron
+            is considered dead.
+        ema_multiplier: EMA decay factor (None to disable EMA).
+        wandb_project: Weights & Biases project name (None to disable wandb).
+        wandb_name: Weights & Biases run name.
+    """
     n_op_shards: int = 1
     n_replicas: int = 1 # 8
 
@@ -736,6 +1116,13 @@ class Config:
 
 
 def main():
+    """
+    Main training function.
+    
+    Sets up distributed training, loads data, initializes the autoencoder,
+    and runs the training loop. Uses transformer_lens to extract activations
+    from GPT-2 as an example data source.
+    """
     cfg = Config()
     comms = make_torch_comms(n_op_shards=cfg.n_op_shards, n_replicas=cfg.n_replicas)
 
