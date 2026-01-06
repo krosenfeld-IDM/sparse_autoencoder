@@ -10,6 +10,14 @@ This repository hosts:
 pip install git+https://github.com/openai/sparse_autoencoder.git
 ```
 
+## Environment details
+```
+uv venv --python 3.11
+uv pip install "numpy<2.0"
+uv pip install torch==2.2
+uv pip install typeguard
+```
+
 ### Code structure
 
 See [sae-viewer](./sae-viewer/README.md) to see the visualizer code, hosted publicly [here](https://openaipublic.blob.core.windows.net/sparse-autoencoder/sae-viewer/index.html).
