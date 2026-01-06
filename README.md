@@ -20,9 +20,6 @@ wandb login
 ```
 uv venv --python 3.11
 uv pip install .
-uv pip install "numpy<2.0"
-uv pip install torch==2.2
-uv pip install typeguard setuptools geom_median
 ```
 
 ### Code structure

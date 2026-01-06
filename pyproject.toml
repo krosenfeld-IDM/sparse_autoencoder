@@ -5,10 +5,16 @@ version = "0.1"
 authors = [{name = "OpenAI"}]
 dependencies = [
     "blobfile == 2.0.2",
-    "torch == 2.1.0",
+    "geom-median>=0.1.0",
+    "numpy<2.0",
+    "python-dotenv>=1.2.1",
+    "setuptools>=80.9.0",
+    "torch==2.2",
     "transformer_lens == 1.9.1",
+    "typeguard>=4.4.4",
 ]
 readme = "README.md"
+requires-python = ">=3.11"
 
 [build-system]
 requires = ["setuptools>=64.0"]
