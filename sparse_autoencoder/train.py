@@ -245,7 +245,7 @@ TRIVIAL_COMMS = ShardingComms(
 def sharded_topk(x, k, sh_comm, capacity_factor=None):
     batch = x.shape[0]
 
-    if capacity_factor is not None:
+    if sh_comm is not None and capacity_factor is not None:
         k_in = min(int(k * capacity_factor // sh_comm.size()), k)
     else:
         k_in = k

@@ -13,9 +13,10 @@ pip install git+https://github.com/openai/sparse_autoencoder.git
 ## Environment details
 ```
 uv venv --python 3.11
+uv pip install .
 uv pip install "numpy<2.0"
 uv pip install torch==2.2
-uv pip install typeguard
+uv pip install typeguard setuptools geom_median
 ```
 
 ### Code structure
